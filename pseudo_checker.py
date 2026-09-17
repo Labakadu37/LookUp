@@ -125,12 +125,14 @@ def build_headers(token):
         h["Authorization"] = token
     return h
 
+CHECK_URL = "https://discord.com/api/v9/users/@me/pomelo-attempt"
+
 def test_token(token):
     """Teste le token directement sur l'endpoint de check."""
     try:
         r = requests.post(
-            "https://discord.com/api/v9/unique-username/batch-validate",
-            json={"usernames": ["zzztest999"]},
+            CHECK_URL,
+            json={"username": "zzztest999"},
             headers=build_headers(token),
             timeout=10
         )
@@ -140,6 +142,8 @@ def test_token(token):
             return False, "401 token rejete"
         if r.status_code == 403:
             return False, "403 acces refuse"
+        if r.status_code == 404:
+            return False, "404 endpoint introuvable (token invalide ou API changee)"
         if r.status_code == 429:
             return True, "OK (rate limit, mais token accepte)"
         return None, f"HTTP {r.status_code} (on tente quand meme)"
@@ -149,8 +153,8 @@ def test_token(token):
 def check(name, session, token, proxies):
     try:
         r = session.post(
-            "https://discord.com/api/v9/unique-username/batch-validate",
-            json={"usernames": [name]},
+            CHECK_URL,
+            json={"username": name},
             headers=build_headers(token),
             proxies=get_proxy(proxies),
             timeout=10
@@ -163,12 +167,12 @@ def check(name, session, token, proxies):
             return "rl"
         if r.status_code == 401:
             with print_lock:
-                print(f" {RED}Token invalide.{RESET}")
+                print(f" {RED}Token invalide (401).{RESET}")
             stop_flag.set()
             return "dead"
         if r.status_code == 200:
-            taken = r.json().get("taken_usernames", [])
-            return "taken" if name in taken else "available"
+            data = r.json()
+            return "taken" if data.get("taken", True) else "available"
         return f"e{r.status_code}"
     except requests.Timeout:
         return "timeout"
