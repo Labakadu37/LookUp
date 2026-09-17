@@ -83,9 +83,8 @@ def build_charset(l, d, dot, un):
 def randname(n, c):
     return "".join(random.choice(c) for _ in range(n))
 
-def get_proxy(proxies):
-    if not proxies: return None
-    p = random.choice(proxies).strip()
+def parse_proxy(raw):
+    p = raw.strip()
     parts = p.split(":")
     if len(parts) == 2:
         return {"http": f"http://{p}", "https": f"http://{p}"}
@@ -95,22 +94,62 @@ def get_proxy(proxies):
         return {"http": url, "https": url}
     return None
 
+class ProxyPool:
+    def __init__(self, raw_list, base_delay):
+        self._lock = threading.Lock()
+        self._base_delay = base_delay
+        self._entries = []
+        if raw_list:
+            for raw in raw_list:
+                p = parse_proxy(raw)
+                if p:
+                    self._entries.append({"proxy": p, "label": raw.strip(), "next": 0.0, "fails": 0, "cooldown": 0.0})
+        else:
+            self._entries.append({"proxy": None, "label": "direct", "next": 0.0, "fails": 0, "cooldown": 0.0})
+
+    def count(self):
+        return len(self._entries)
+
+    def acquire(self):
+        while not stop_flag.is_set():
+            with self._lock:
+                now = time.time()
+                best = None
+                best_time = float("inf")
+                for e in self._entries:
+                    ready = max(e["next"], e["cooldown"])
+                    if ready < best_time:
+                        best_time = ready
+                        best = e
+                if best is None:
+                    return None, None
+                wait = best_time - now
+                if wait <= 0:
+                    best["next"] = now + self._base_delay
+                    return best["proxy"], best
+            time.sleep(min(wait, 0.5))
+        return None, None
+
+    def report_ok(self, entry):
+        with self._lock:
+            entry["fails"] = 0
+            entry["cooldown"] = 0.0
+
+    def report_rate_limit(self, entry, wait_s):
+        with self._lock:
+            entry["cooldown"] = time.time() + wait_s
+            entry["fails"] += 1
+
+    def report_fail(self, entry):
+        with self._lock:
+            entry["fails"] += 1
+            penalty = min(30, 2 ** entry["fails"])
+            entry["cooldown"] = time.time() + penalty
+
 stats      = {"total":0, "avail":0, "taken":0, "err":0}
 stats_lock = threading.Lock()
 print_lock = threading.Lock()
 stop_flag  = threading.Event()
-rate_lock  = threading.Lock()
-next_slot  = [0.0]
-
-def rate_limiter(delay):
-    with rate_lock:
-        now = time.time()
-        if next_slot[0] < now:
-            next_slot[0] = now
-        wait = next_slot[0] - now
-        next_slot[0] += delay
-    if wait > 0:
-        time.sleep(wait)
 
 def build_headers(token):
     h = {
@@ -150,36 +189,33 @@ def test_token(token):
     except Exception as e:
         return None, str(e)[:40]
 
-def check(name, session, token, proxies):
+def check(name, session, token, proxy_dict):
     try:
         r = session.post(
             CHECK_URL,
             json={"username": name},
             headers=build_headers(token),
-            proxies=get_proxy(proxies),
+            proxies=proxy_dict,
             timeout=10
         )
         if r.status_code == 429:
             w = float(r.headers.get("Retry-After", 5))
-            with print_lock:
-                print(f" {YELLOW}Rate limit {w}s{RESET}", flush=True)
-            time.sleep(w)
-            return "rl"
+            return "rl", w
         if r.status_code == 401:
             with print_lock:
                 print(f" {RED}Token invalide (401).{RESET}")
             stop_flag.set()
-            return "dead"
+            return "dead", 0
         if r.status_code == 200:
             data = r.json()
-            return "taken" if data.get("taken", True) else "available"
-        return f"e{r.status_code}"
+            return ("taken" if data.get("taken", True) else "available"), 0
+        return f"e{r.status_code}", 0
     except requests.Timeout:
-        return "timeout"
+        return "timeout", 0
     except Exception:
-        return "error"
+        return "error", 0
 
-def worker(token, proxies, length, chars, delay, seen, seen_lock, start):
+def worker(token, pool, length, chars, seen, seen_lock, start):
     session = requests.Session()
     max_possible = len(chars) ** length
     while not stop_flag.is_set():
@@ -196,21 +232,34 @@ def worker(token, proxies, length, chars, delay, seen, seen_lock, start):
                     break
             else:
                 continue
-        rate_limiter(delay)
+
+        proxy_dict, entry = pool.acquire()
         if stop_flag.is_set():
             return
-        status = check(name, session, token, proxies)
+
+        status, rl_wait = check(name, session, token, proxy_dict)
+
         if status == "dead":
             continue
         if status == "rl":
-            # Retenter le meme pseudo apres le rate limit
-            while not stop_flag.is_set():
-                rate_limiter(delay)
-                status = check(name, session, token, proxies)
-                if status != "rl":
-                    break
+            pool.report_rate_limit(entry, rl_wait)
+            with print_lock:
+                lbl = entry["label"][:20]
+                print(f" {YELLOW}Rate limit {rl_wait}s — {lbl} en cooldown{RESET}", flush=True)
+            proxy_dict, entry = pool.acquire()
+            if stop_flag.is_set():
+                return
+            status, rl_wait = check(name, session, token, proxy_dict)
+            if status == "rl":
+                pool.report_rate_limit(entry, rl_wait)
+                continue
             if status == "dead" or stop_flag.is_set():
                 continue
+        if status in ("timeout", "error"):
+            pool.report_fail(entry)
+        else:
+            pool.report_ok(entry)
+
         with stats_lock:
             stats["total"] += 1
             if status == "available": stats["avail"] += 1
@@ -296,8 +345,12 @@ def main():
     else:
         print(f" {YELLOW}Sans token — l'API bloque souvent (403/404).{RESET}\n")
 
-    proxies = load_proxies()
-    print(f" {GREEN}{len(proxies)} proxies{RESET}\n" if proxies else f" {GRAY}IP directe{RESET}\n")
+    raw_proxies = load_proxies()
+    if raw_proxies:
+        print(f" {GREEN}{len(raw_proxies)} proxies charges{RESET}")
+        print(f" {GRAY}Rotation auto + cooldown par proxy{RESET}\n")
+    else:
+        print(f" {GRAY}IP directe (ajoute proxies.txt pour eviter les rate limits){RESET}\n")
 
     length  = ask("Longueur [4]:", 4, int)
     speed   = ask("Vitesse /s [2]:", 2.0, float)
@@ -312,7 +365,8 @@ def main():
         yn("Underscores _ ?", False),
     )
 
-    print(f"\n {GRAY}{len(chars)} chars — {threads} threads — {speed}/s{RESET}\n")
+    pool = ProxyPool(raw_proxies, delay)
+    print(f"\n {GRAY}{len(chars)} chars — {threads} threads — {speed}/s — {pool.count()} proxy(s){RESET}\n")
     input(f" {rgb(225,195,155,'Entree pour lancer...')}")
 
     print(f"\n{GRAY} N°   PSEUDO      STATUT      SPEED{RESET}")
@@ -324,7 +378,7 @@ def main():
     for _ in range(max(1, threads)):
         threading.Thread(
             target=worker,
-            args=(token, proxies, length, chars, delay, seen, seen_lock, start),
+            args=(token, pool, length, chars, seen, seen_lock, start),
             daemon=True
         ).start()
 
