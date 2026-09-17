@@ -4,7 +4,18 @@ import time
 import os
 import sys
 import threading
-import requests
+import subprocess
+
+try:
+    import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests[socks]", "-q"])
+    import requests
+
+try:
+    import socks  # noqa: F401
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "PySocks", "-q"])
 
 RESET  = "\033[0m"
 GREEN  = "\033[92m"
@@ -85,6 +96,11 @@ def randname(n, c):
 
 def parse_proxy(raw):
     p = raw.strip()
+    if "://" in p:
+        proto = p.split("://")[0].lower()
+        if proto in ("socks5", "socks4", "socks5h", "socks4a"):
+            return {"http": p, "https": p}
+        return {"http": p, "https": p}
     parts = p.split(":")
     if len(parts) == 2:
         return {"http": f"http://{p}", "https": f"http://{p}"}
